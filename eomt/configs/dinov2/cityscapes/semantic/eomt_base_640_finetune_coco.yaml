@@ -1,0 +1,35 @@
+trainer:
+  max_epochs: 30
+  logger:
+    class_path: lightning.pytorch.loggers.wandb.WandbLogger
+    init_args:
+      resume: allow
+      project: "eomt"
+      name: "cityscapes_semantic_finetune_from_coco"
+
+model:
+  class_path: training.mask_classification_semantic_finetune.MaskClassificationSemanticFinetune
+  init_args:
+    ckpt_path: null                   # <-- set to your COCO checkpoint path
+    load_ckpt_class_head: false       # COCO has 133 classes, Cityscapes has 19 — skip the head
+    freeze_backbone: true             # Phase 1: train only mask_head, class_head, queries
+    unfreeze_last_n_blocks: 4         # Phase 2: unfreeze last 4 ViT blocks after warmup
+    unfreeze_at_step: 2000            # Switch from phase 1 to phase 2 at step 2000
+    attn_mask_annealing_enabled: True
+    attn_mask_annealing_start_steps: [3317, 8292, 13268]
+    attn_mask_annealing_end_steps: [6634, 11609, 16585]
+    lr: 5e-5                          # Lower than from-scratch (1e-4)
+    llrd: 0.8
+    weight_decay: 0.05
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_q: 100
+        num_blocks: 3
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_base_patch14_reg4_dinov2
+
+data:
+  class_path: datasets.cityscapes_semantic.CityscapesSemantic
