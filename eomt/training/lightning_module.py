@@ -902,6 +902,12 @@ class LightningModule(lightning.LightningModule):
                 ]
             else:
                 missing_keys = incompatible_keys.missing_keys
+            # `criterion.empty_weight` is intentionally dropped by `_load_ckpt` (its
+            # shape depends on num_classes); the freshly-built buffer must remain, so
+            # it is expected to be missing when loading a checkpoint from another task.
+            missing_keys = [
+                key for key in missing_keys if "criterion.empty_weight" not in key
+            ]
             if missing_keys:
                 raise ValueError(f"Missing keys: {missing_keys}")
         if incompatible_keys.unexpected_keys:

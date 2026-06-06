@@ -1,0 +1,54 @@
+# Fine-tune the COCO-pretrained EoMT on Cityscapes semantic segmentation.
+# Experiment A: head-only -- freeze the entire ViT backbone, train only the
+# queries + class head + mask head + upscale (the task/prediction head).
+#
+# Loads ../../eomt_coco.bin (num_q=200, num_blocks=3, 640px) and reinitializes
+# only the class head (133+1 -> 19+1) via load_ckpt_class_head: False.
+#
+# Run (use --data.num_workers 0 if /dev/shm is small, e.g. default Docker = 64MB,
+# otherwise the dataloader workers crash with a "Bus error / out of shared memory"):
+#   WANDB_MODE=offline python main.py fit \
+#     -c configs/dinov2/cityscapes/semantic/eomt_base_640_ft_coco_headonly.yaml \
+#     --data.path ../../cityscapes --data.batch_size 8 --data.num_workers 0 --compile_disabled
+trainer:
+  max_epochs: 40
+  logger:
+    class_path: lightning.pytorch.loggers.wandb.WandbLogger
+    init_args:
+      resume: allow
+      project: "eomt"
+      name: "cityscapes_ft_coco_headonly"
+  callbacks:
+    - class_path: training.finetune_freeze.PartialFreeze
+      init_args:
+        freeze_patterns: ["network.encoder.backbone"]
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "checkpoints/ft_coco_headonly"
+        filename: "ft_coco_headonly-{epoch:02d}"
+        monitor: "metrics/val_iou_all"
+        mode: "max"
+        save_top_k: 1
+        save_last: True
+model:
+  class_path: training.mask_classification_semantic.MaskClassificationSemantic
+  init_args:
+    attn_mask_annealing_enabled: False
+    lr: 5.0e-4
+    warmup_steps: [200, 500]
+    ckpt_path: ../../eomt_coco.bin
+    load_ckpt_class_head: False
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_q: 200
+        num_blocks: 3
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_base_patch14_reg4_dinov2
+data:
+  class_path: datasets.cityscapes_semantic.CityscapesSemantic
+  init_args:
+    num_classes: 19
+    img_size: [640, 640]

@@ -1,0 +1,62 @@
+# Fine-tune the COCO-pretrained EoMT on Cityscapes semantic segmentation.
+# Experiment C: FULL fine-tuning -- single-stage, the WHOLE ViT backbone trains
+# jointly with the heads/queries (no PartialFreeze). This is the canonical EoMT
+# recipe (cf. eomt_base_640.yaml) that reaches the performance ceiling; freezing
+# capped earlier runs (head-only 74.0%, unfreeze-4 76.7%).
+#
+# The fresh class head does NOT need a manual head-only warmup phase: the repo's
+# TwoStageWarmupPolySchedule warms the backbone on a slower schedule than the heads,
+# and layer-wise LR decay (llrd=0.8) gives deep blocks ~10x smaller LR than block 11,
+# so the pretrained DINOv2 features are protected from early noisy gradients.
+#
+# Starts from ../../eomt_coco.bin (num_q=200, num_blocks=3, 640px); only the class
+# head is reinitialized (133+1 -> 19+1) via load_ckpt_class_head: False.
+# attn_mask_annealing stays OFF: we load already-converged attn_mask_probs from COCO.
+#
+# Writes to checkpoints/ft_coco_full_long/ -- the head-only and unfreeze checkpoint
+# dirs are left untouched.
+#
+# Run (use --data.num_workers 0 if /dev/shm is small, e.g. default Docker = 64MB;
+# with /dev/shm >= 8GB use 12 workers for ~3x throughput):
+#   WANDB_MODE=offline python main.py fit \
+#     -c configs/dinov2/cityscapes/semantic/eomt_base_640_ft_coco_full.yaml \
+#     --data.path ../../cityscapes --data.batch_size 4 --data.num_workers 12 --compile_disabled
+trainer:
+  max_epochs: 60
+  logger:
+    class_path: lightning.pytorch.loggers.wandb.WandbLogger
+    init_args:
+      resume: allow
+      project: "eomt"
+      name: "cityscapes_ft_coco_full"
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "checkpoints/ft_coco_full_long"
+        filename: "ft_coco_full-{epoch:02d}"
+        monitor: "metrics/val_iou_all"
+        mode: "max"
+        save_top_k: 1
+        save_last: True
+model:
+  class_path: training.mask_classification_semantic.MaskClassificationSemantic
+  init_args:
+    attn_mask_annealing_enabled: False
+    lr: 1.0e-4
+    warmup_steps: [500, 1000]
+    ckpt_path: ../../eomt_coco.bin
+    load_ckpt_class_head: False
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_q: 200
+        num_blocks: 3
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_base_patch14_reg4_dinov2
+data:
+  class_path: datasets.cityscapes_semantic.CityscapesSemantic
+  init_args:
+    num_classes: 19
+    img_size: [640, 640]

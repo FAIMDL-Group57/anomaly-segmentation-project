@@ -1,0 +1,64 @@
+# Fine-tune the COCO-pretrained EoMT on Cityscapes semantic segmentation.
+# Experiment B: progressive unfreeze -- TRUE progressive fine-tuning, continuing
+# from the head-only run (Experiment A). The class/mask heads + queries are already
+# adapted; here we additionally relax the last 4 transformer blocks (8-11 of 12) and
+# the final backbone norm, with a low lr to protect the pretrained features.
+#
+# Starts from the head-only checkpoint (load_ckpt_class_head: True keeps its trained
+# 19+1 class head). Unfreezing back-propagates through blocks 8-11, so activations +
+# optimizer states for those blocks stay resident -> uses MORE VRAM than head-only;
+# run at batch_size 4 to stay within 24GB.
+#
+# Run (use --data.num_workers 0 if /dev/shm is small, e.g. default Docker = 64MB,
+# otherwise the dataloader workers crash with a "Bus error / out of shared memory"):
+#   WANDB_MODE=offline python main.py fit \
+#     -c configs/dinov2/cityscapes/semantic/eomt_base_640_ft_coco_unfreeze.yaml \
+#     --data.path ../../cityscapes --data.batch_size 4 --data.num_workers 0 --compile_disabled
+trainer:
+  max_epochs: 12
+  logger:
+    class_path: lightning.pytorch.loggers.wandb.WandbLogger
+    init_args:
+      resume: allow
+      project: "eomt"
+      name: "cityscapes_ft_coco_unfreeze"
+  callbacks:
+    - class_path: training.finetune_freeze.PartialFreeze
+      init_args:
+        freeze_patterns: ["network.encoder.backbone"]
+        unfreeze_patterns:
+          - "network.encoder.backbone.blocks.8."
+          - "network.encoder.backbone.blocks.9."
+          - "network.encoder.backbone.blocks.10."
+          - "network.encoder.backbone.blocks.11."
+          - "network.encoder.backbone.norm"
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "checkpoints/ft_coco_unfreeze"
+        filename: "ft_coco_unfreeze-{epoch:02d}"
+        monitor: "metrics/val_iou_all"
+        mode: "max"
+        save_top_k: 1
+        save_last: True
+model:
+  class_path: training.mask_classification_semantic.MaskClassificationSemantic
+  init_args:
+    attn_mask_annealing_enabled: False
+    lr: 1.0e-4
+    warmup_steps: [200, 500]
+    ckpt_path: checkpoints/ft_coco_headonly/ft_coco_headonly-epoch=09.ckpt
+    load_ckpt_class_head: True
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_q: 200
+        num_blocks: 3
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_base_patch14_reg4_dinov2
+data:
+  class_path: datasets.cityscapes_semantic.CityscapesSemantic
+  init_args:
+    num_classes: 19
+    img_size: [640, 640]
