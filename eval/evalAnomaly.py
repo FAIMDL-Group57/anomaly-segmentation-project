@@ -40,6 +40,15 @@ target_transform = Compose(
     ]
 )
 
+def _store_anomaly_result(anomaly_result, path):
+    # --- save anomaly heatmap for visual inspection ---
+    os.makedirs("anomaly_vis", exist_ok=True)
+    norm = (anomaly_result - anomaly_result.min()) / (np.ptp(anomaly_result) + 1e-8)
+    heatmap = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    # resize heatmap back to the original image resolution so they match
+    orig = Image.open(path)
+    heatmap = cv2.resize(heatmap, orig.size)  # PIL .size is (width, height)
+    cv2.imwrite(osp.join("anomaly_vis", osp.basename(path).rsplit(".", 1)[0] + "_anomaly.png"), heatmap)
 
 def main():
     parser = ArgumentParser()
@@ -96,11 +105,13 @@ def main():
     
     for path in glob.glob(os.path.expanduser(str(args.input[0]))):
         print(path)
-        images = input_transform((Image.open(path).convert('RGB'))).unsqueeze(0).float().cuda()
-        images = images.permute(0,3,1,2)
+        images = input_transform((Image.open(path).convert('RGB'))).unsqueeze(0).float()
+        if not args.cpu:
+            images = images.cuda()
         with torch.no_grad():
             result = model(images)
-        anomaly_result = 1.0 - np.max(result.squeeze(0).data.cpu().numpy(), axis=0)            
+        anomaly_result = 1.0 - np.max(result.squeeze(0).data.cpu().numpy(), axis=0)   
+        _store_anomaly_result(anomaly_result, path)         
         pathGT = path.replace("images", "labels_masks")                
         if "RoadObsticle21" in pathGT:
            pathGT = pathGT.replace("webp", "png")
