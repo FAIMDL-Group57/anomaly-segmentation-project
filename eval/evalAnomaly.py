@@ -40,15 +40,40 @@ target_transform = Compose(
     ]
 )
 
-def _store_anomaly_result(anomaly_result, path):
+def compute_anomaly_score(result, method):
+    # result: raw ERFNet logits, shape [1, C, H, W]. Returns a [H, W] anomaly
+    # map where higher = more anomalous (out-of-distribution).
+    logits = result.squeeze(0)  # [C, H, W]
+    if method == "maxlogit":
+        # negative max logit: confident (high logit) -> low anomaly score
+        anomaly = -torch.max(logits, dim=0).values
+    elif method == "msp":
+        # 1 - maximum softmax probability
+        probs = torch.softmax(logits, dim=0)
+        anomaly = 1.0 - torch.max(probs, dim=0).values
+    elif method == "maxentropy":
+        # Shannon entropy of the softmax distribution
+        probs = torch.softmax(logits, dim=0)
+        anomaly = -torch.sum(probs * torch.log(probs + 1e-12), dim=0)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    return anomaly.data.cpu().numpy()
+
+def _store_anomaly_result(anomaly_result, path, method):
     # --- save anomaly heatmap for visual inspection ---
-    os.makedirs("anomaly_vis", exist_ok=True)
+    # one sub-folder per validation dataset, then per method
+    # (msp / maxlogit / maxentropy), so heatmaps are grouped by the set they
+    # came from and the scoring method used.
+    dataset = osp.basename(osp.dirname(osp.dirname(path)))  # .../<dataset>/images/<file>
+    out_dir = osp.join("anomaly_vis", dataset, method)
+    os.makedirs(out_dir, exist_ok=True)
     norm = (anomaly_result - anomaly_result.min()) / (np.ptp(anomaly_result) + 1e-8)
     heatmap = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
     # resize heatmap back to the original image resolution so they match
     orig = Image.open(path)
     heatmap = cv2.resize(heatmap, orig.size)  # PIL .size is (width, height)
-    cv2.imwrite(osp.join("anomaly_vis", osp.basename(path).rsplit(".", 1)[0] + "_anomaly.png"), heatmap)
+    fname = osp.basename(path).rsplit(".", 1)[0] + ".png"
+    cv2.imwrite(osp.join(out_dir, fname), heatmap)
 
 def main():
     parser = ArgumentParser()
@@ -67,6 +92,9 @@ def main():
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--cpu', action='store_true')
+    parser.add_argument('--method', default='msp',
+                        choices=['msp', 'maxlogit', 'maxentropy'],
+                        help='post-hoc anomaly score: MSP, Max Logit or Max Entropy')
     args = parser.parse_args()
     anomaly_score_list = []
     ood_gts_list = []
@@ -110,8 +138,8 @@ def main():
             images = images.cuda()
         with torch.no_grad():
             result = model(images)
-        anomaly_result = 1.0 - np.max(result.squeeze(0).data.cpu().numpy(), axis=0)   
-        _store_anomaly_result(anomaly_result, path)         
+        anomaly_result = compute_anomaly_score(result, args.method)
+        _store_anomaly_result(anomaly_result, path, args.method)
         pathGT = path.replace("images", "labels_masks")                
         if "RoadObsticle21" in pathGT:
            pathGT = pathGT.replace("webp", "png")
@@ -164,10 +192,12 @@ def main():
     prc_auc = average_precision_score(val_label, val_out)
     fpr = fpr_at_95_tpr(val_out, val_label)
 
+    print(f'Method: {args.method}')
     print(f'AUPRC score: {prc_auc*100.0}')
     print(f'FPR@TPR95: {fpr*100.0}')
 
-    file.write(('    AUPRC score:' + str(prc_auc*100.0) + '   FPR@TPR95:' + str(fpr*100.0) ))
+    file.write(('method:' + args.method + '   input:' + str(args.input[0]) +
+                '   AUPRC score:' + str(prc_auc*100.0) + '   FPR@TPR95:' + str(fpr*100.0) ))
     file.close()
 
 if __name__ == '__main__':
