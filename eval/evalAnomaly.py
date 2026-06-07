@@ -59,21 +59,22 @@ def compute_anomaly_score(result, method):
         raise ValueError(f"Unknown method: {method}")
     return anomaly.data.cpu().numpy()
 
-def _store_anomaly_result(anomaly_result, path, method):
-    # --- save anomaly heatmap for visual inspection ---
+def _store_anomaly_result(anomaly_result, path, method, threshold=0.5):
+    # --- save anomaly mask for visual inspection ---
     # one sub-folder per validation dataset, then per method
-    # (msp / maxlogit / maxentropy), so heatmaps are grouped by the set they
+    # (msp / maxlogit / maxentropy), so masks are grouped by the set they
     # came from and the scoring method used.
     dataset = osp.basename(osp.dirname(osp.dirname(path)))  # .../<dataset>/images/<file>
     out_dir = osp.join("anomaly_vis", dataset, method)
     os.makedirs(out_dir, exist_ok=True)
     norm = (anomaly_result - anomaly_result.min()) / (np.ptp(anomaly_result) + 1e-8)
-    heatmap = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
-    # resize heatmap back to the original image resolution so they match
+    # pixels scoring above the threshold are anomalies -> white, the rest black
+    mask = (norm > threshold).astype(np.uint8) * 255
+    # resize mask back to the original image resolution so they match
     orig = Image.open(path)
-    heatmap = cv2.resize(heatmap, orig.size)  # PIL .size is (width, height)
+    mask = cv2.resize(mask, orig.size, interpolation=cv2.INTER_NEAREST)  # PIL .size is (width, height)
     fname = osp.basename(path).rsplit(".", 1)[0] + ".png"
-    cv2.imwrite(osp.join(out_dir, fname), heatmap)
+    cv2.imwrite(osp.join(out_dir, fname), mask)
 
 def main():
     parser = ArgumentParser()
