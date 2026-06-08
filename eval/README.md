@@ -84,3 +84,10 @@ python eval_forwardTime.py
 
 
 
+# How to run all anomaly eval metrix
+```bash
+for m in msp maxlogit maxentropy; do
+  python3 evalAnomaly.py --method $m --cpu \
+    --input "Anomaly_Validation_Datasets/Validation_Dataset/RoadObsticle21/images/*.webp"
+done
+```
