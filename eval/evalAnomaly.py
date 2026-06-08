@@ -22,6 +22,33 @@ torch.manual_seed(seed)
 
 NUM_CHANNELS = 3
 NUM_CLASSES = 20
+
+# Cityscapes 19-class colours (RGB), index 19 = void -> black.
+CITYSCAPES_PALETTE = np.array([
+    (128, 64, 128),   # 0  road           - purple
+    (244, 35, 232),   # 1  sidewalk       - pink/magenta
+    (70, 70, 70),     # 2  building       - dark gray
+    (102, 102, 156),  # 3  wall           - slate blue
+    (190, 153, 153),  # 4  fence          - dusty rose
+    (153, 153, 153),  # 5  pole           - gray
+    (250, 170, 30),   # 6  traffic light  - orange
+    (220, 220, 0),    # 7  traffic sign   - yellow
+    (107, 142, 35),   # 8  vegetation     - olive green
+    (152, 251, 152),  # 9  terrain        - light green
+    (70, 130, 180),   # 10 sky            - steel blue
+    (220, 20, 60),    # 11 person         - crimson red
+    (255, 0, 0),      # 12 rider          - red
+    (0, 0, 142),      # 13 car            - dark blue
+    (0, 0, 70),       # 14 truck          - navy blue
+    (0, 60, 100),     # 15 bus            - dark teal blue
+    (0, 80, 100),     # 16 train          - teal blue
+    (0, 0, 230),      # 17 motorcycle     - bright blue
+    (119, 11, 32),    # 18 bicycle        - dark red/maroon
+    (0, 0, 0),        # 19 void           - black
+], dtype=np.uint8)
+
+# colour anomaly pixels with something not in the palette so they stand out.
+ANOMALY_COLOR = (255, 0, 255)  # magenta (RGB)
 # gpu training specific
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = True
@@ -59,22 +86,28 @@ def compute_anomaly_score(result, method):
         raise ValueError(f"Unknown method: {method}")
     return anomaly.data.cpu().numpy()
 
-def _store_anomaly_result(anomaly_result, path, method, threshold=0.5):
-    # --- save anomaly mask for visual inspection ---
+def _store_anomaly_result(anomaly_result, result, path, method, threshold=0.5):
+    # --- save the model's prediction + anomaly overlay for visual inspection ---
     # one sub-folder per validation dataset, then per method
-    # (msp / maxlogit / maxentropy), so masks are grouped by the set they
+    # (msp / maxlogit / maxentropy), so images are grouped by the set they
     # came from and the scoring method used.
     dataset = osp.basename(osp.dirname(osp.dirname(path)))  # .../<dataset>/images/<file>
     out_dir = osp.join("anomaly_vis", dataset, method)
     os.makedirs(out_dir, exist_ok=True)
+
+    # colour each pixel by the class ERFNet predicts for it (Cityscapes palette)
+    pred = torch.argmax(result.squeeze(0), dim=0).cpu().numpy()  # [H, W] class ids
+    vis = CITYSCAPES_PALETTE[pred]  # [H, W, 3] RGB
+
+    # paint pixels scored as anomalous (above threshold) in a distinct colour
     norm = (anomaly_result - anomaly_result.min()) / (np.ptp(anomaly_result) + 1e-8)
-    # pixels scoring above the threshold are anomalies -> white, the rest black
-    mask = (norm > threshold).astype(np.uint8) * 255
-    # resize mask back to the original image resolution so they match
+    vis[norm > threshold] = ANOMALY_COLOR
+
+    # resize back to the original image resolution so they match
     orig = Image.open(path)
-    mask = cv2.resize(mask, orig.size, interpolation=cv2.INTER_NEAREST)  # PIL .size is (width, height)
+    vis = cv2.resize(vis, orig.size, interpolation=cv2.INTER_NEAREST)  # PIL .size is (width, height)
     fname = osp.basename(path).rsplit(".", 1)[0] + ".png"
-    cv2.imwrite(osp.join(out_dir, fname), mask)
+    cv2.imwrite(osp.join(out_dir, fname), cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
 
 def main():
     parser = ArgumentParser()
@@ -140,7 +173,7 @@ def main():
         with torch.no_grad():
             result = model(images)
         anomaly_result = compute_anomaly_score(result, args.method)
-        _store_anomaly_result(anomaly_result, path, args.method)
+        _store_anomaly_result(anomaly_result, result, path, args.method)
         pathGT = path.replace("images", "labels_masks")                
         if "RoadObsticle21" in pathGT:
            pathGT = pathGT.replace("webp", "png")
