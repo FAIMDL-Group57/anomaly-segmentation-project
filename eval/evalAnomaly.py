@@ -26,6 +26,14 @@ NUM_CLASSES = 20
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = True
 
+# Folder names of the anomaly validation sets used by --full-report. Same set as
+# the EoMT mask baseline (eval/evalAnomalyMask.py) so the two reports line up.
+DATASET_NAMES = ["RoadAnomaly21", "RoadObsticle21", "FS_LostFound_full",
+                 "fs_static", "RoadAnomaly"]
+
+# Post-hoc methods the pixel baseline supports (no RbA -- that is mask-specific).
+ALL_METHODS = ["msp", "maxlogit", "maxentropy"]
+
 input_transform = Compose(
     [
         Resize((512, 1024), Image.BILINEAR),
@@ -75,6 +83,126 @@ def _store_anomaly_result(anomaly_result, path, method):
     fname = osp.basename(path).rsplit(".", 1)[0] + ".png"
     cv2.imwrite(osp.join(out_dir, fname), heatmap)
 
+
+# ---------------------------------------------------------------------------
+# Full-report helpers: evaluate every dataset with every method in one pass.
+# ---------------------------------------------------------------------------
+def _msp(logits, t):
+    # 1 - max softmax probability, with temperature scaling applied to the logits.
+    probs = torch.softmax(logits / t, dim=0)
+    return (1.0 - torch.max(probs, dim=0).values).data.cpu().numpy()
+
+def compute_all_anomaly_scores(result, methods, temperatures):
+    # One forward pass -> every requested anomaly map. Mirrors compute_anomaly_score
+    # but returns {score_name: [H, W] array} (higher = more anomalous) and adds the
+    # temperature-scaled MSP variants used in the report.
+    logits = result.squeeze(0)  # [C, H, W]
+    out = {}
+    if "maxlogit" in methods:
+        out["maxlogit"] = (-torch.max(logits, dim=0).values).data.cpu().numpy()
+    if "maxentropy" in methods:
+        probs = torch.softmax(logits, dim=0)
+        out["maxentropy"] = (
+            -torch.sum(probs * torch.log(probs + 1e-12), dim=0)).data.cpu().numpy()
+    if "msp" in methods:
+        out["msp"] = _msp(logits, 1.0)
+        for t in temperatures:
+            out[f"msp_t{t:g}"] = _msp(logits, t)
+    return out
+
+def load_ood_gts(path):
+    # Resolve the ground-truth mask for an image and standardise it to
+    # {0: inlier, 1: anomaly, 255: ignore}, matching the per-dataset remapping the
+    # single-method path uses below.
+    pathGT = path.replace("images", "labels_masks")
+    if "RoadObsticle21" in pathGT:
+        pathGT = pathGT.replace("webp", "png")
+    if "fs_static" in pathGT:
+        pathGT = pathGT.replace("jpg", "png")
+    if "RoadAnomaly" in pathGT:
+        pathGT = pathGT.replace("jpg", "png")
+
+    mask = target_transform(Image.open(pathGT))
+    ood_gts = np.array(mask)
+
+    if "RoadAnomaly" in pathGT:
+        ood_gts = np.where((ood_gts == 2), 1, ood_gts)
+    if "LostAndFound" in pathGT:
+        ood_gts = np.where((ood_gts == 0), 255, ood_gts)
+        ood_gts = np.where((ood_gts == 1), 0, ood_gts)
+        ood_gts = np.where((ood_gts > 1) & (ood_gts < 201), 1, ood_gts)
+    if "Streethazard" in pathGT:
+        ood_gts = np.where((ood_gts == 14), 255, ood_gts)
+        ood_gts = np.where((ood_gts < 20), 0, ood_gts)
+        ood_gts = np.where((ood_gts == 255), 1, ood_gts)
+    return ood_gts
+
+def evaluate_dataset_full(model, dataset_dir, args, methods, temperatures):
+    """Return {score_name: (auprc, fpr95)} for one anomaly dataset."""
+    img_paths = sorted(
+        p for p in glob.glob(osp.join(dataset_dir, "images", "*"))
+        if p.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+    )
+    score_lists, gt_list = {}, []
+    for path in img_paths:
+        images = input_transform(Image.open(path).convert("RGB")).unsqueeze(0).float()
+        if not args.cpu:
+            images = images.cuda()
+        with torch.no_grad():
+            result = model(images)
+        scores = compute_all_anomaly_scores(result, methods, temperatures)
+        try:
+            ood_gts = load_ood_gts(path)
+        except FileNotFoundError:
+            continue
+        if 1 not in np.unique(ood_gts):
+            continue  # need anomaly pixels (same rule as the single-method path)
+        valid = (ood_gts == 0) | (ood_gts == 1)
+        gt_list.append(ood_gts[valid])
+        for name, amap in scores.items():
+            score_lists.setdefault(name, []).append(amap[valid])
+        del result
+        if not args.cpu:
+            torch.cuda.empty_cache()
+
+    if not gt_list:
+        return {}
+
+    val_label = np.concatenate(gt_list)
+    results = {}
+    for name, chunks in score_lists.items():
+        val_out = np.concatenate(chunks)
+        auprc = average_precision_score(val_label, val_out) * 100.0
+        fpr = fpr_at_95_tpr(val_out, val_label) * 100.0
+        results[name] = (auprc, fpr)
+    return results
+
+def run_full_report(model, args):
+    report_fh = open(args.report_file, "a") if args.report_file else None
+    for dataset_name in DATASET_NAMES:
+        dataset_dir = osp.join(args.anomaly_datadir, dataset_name)
+        if not osp.isdir(dataset_dir):
+            print(f"  [skip] missing {dataset_dir}")
+            continue
+        header = f"-- {dataset_name} --"
+        print(f"\n{header}", flush=True)
+        if report_fh:
+            report_fh.write(f"\n{header}\n")
+        res = evaluate_dataset_full(model, dataset_dir, args,
+                                    ALL_METHODS, args.temperatures)
+        for score_name, (auprc, fpr) in res.items():
+            line = (f"  {dataset_name:<18} {score_name:<10} "
+                    f"AuPRC {auprc:6.2f}  FPR95 {fpr:6.2f}")
+            print(line, flush=True)
+            if report_fh:
+                report_fh.write(line + "\n")
+        if report_fh:
+            report_fh.flush()
+    if report_fh:
+        report_fh.close()
+        print(f"\nDone. Appended full report to {args.report_file}")
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument(
@@ -95,6 +223,21 @@ def main():
     parser.add_argument('--method', default='msp',
                         choices=['msp', 'maxlogit', 'maxentropy'],
                         help='post-hoc anomaly score: MSP, Max Logit or Max Entropy')
+    parser.add_argument('--full-report', action='store_true',
+                        help='evaluate ALL datasets with ALL methods (incl. '
+                             'temperature-scaled MSP) and print a grouped report')
+    parser.add_argument('--anomaly-datadir',
+                        default=osp.join(osp.dirname(osp.abspath(__file__)),
+                                         'Anomaly_Validation_Datasets',
+                                         'Validation_Dataset'),
+                        help='folder containing the anomaly dataset subfolders '
+                             '(used by --full-report)')
+    parser.add_argument('--temperatures', nargs='*', type=float,
+                        default=[0.5, 0.75, 1.1],
+                        help='extra MSP temperatures for --full-report '
+                             '(t=1.0 is always included)')
+    parser.add_argument('--report-file', default='all_results_table.txt',
+                        help='append the --full-report output to this file')
     args = parser.parse_args()
     anomaly_score_list = []
     ood_gts_list = []
@@ -130,7 +273,11 @@ def main():
     model = load_my_state_dict(model, torch.load(weightspath, map_location=lambda storage, loc: storage))
     print ("Model and weights LOADED successfully")
     model.eval()
-    
+
+    if args.full_report:
+        run_full_report(model, args)
+        return
+
     for path in glob.glob(os.path.expanduser(str(args.input[0]))):
         print(path)
         images = input_transform((Image.open(path).convert('RGB'))).unsqueeze(0).float()
