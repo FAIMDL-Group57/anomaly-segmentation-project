@@ -82,14 +82,23 @@ python eval_forwardTime.py
 
 **NOTE**: The pytorch code is a bit faster, but cudahalf (FP16) seems to give problems at the moment for some pytorch versions so this code only runs at FP32 (a bit slower).
 
+# Download validationdata
+
+Download the validation data from [Google Drive](https://drive.google.com/drive/folders/1q2vHUzora2nP52fP50zmoQAykWuwoGav) and place it under:
+
+```
+eval/Anomaly_Validation_Datasets/Validation_Dataset/
+```
+
+# Trained models
+
+Make sure have done the creting or downloading og the models. How to do so is described in [eomt/README.md](../eomt/README.md).
 
 
 # How to run all anomaly eval metrix (ErfNet)
 ```bash
-for m in msp maxlogit maxentropy; do
-  python3 evalAnomaly.py --method $m --cpu \
-    --input "Anomaly_Validation_Datasets/Validation_Dataset/RoadObsticle21/images/*.webp"
-done
+python3 evalAnomaly.py --full-report --cpu
+
 ```
 
 # How to run EOmT
@@ -99,7 +108,5 @@ python evalAnomalyMask.py \
     --models finetuned cityscapes coco \
     --methods msp maxlogit maxentropy rba \
     --temperatures 0.5 0.75 1.1 --store
-
-
 ```
 
