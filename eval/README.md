@@ -84,10 +84,22 @@ python eval_forwardTime.py
 
 
 
-# How to run all anomaly eval metrix
+# How to run all anomaly eval metrix (ErfNet)
 ```bash
 for m in msp maxlogit maxentropy; do
   python3 evalAnomaly.py --method $m --cpu \
     --input "Anomaly_Validation_Datasets/Validation_Dataset/RoadObsticle21/images/*.webp"
 done
 ```
+
+# How to run EOmT
+```bash
+cd "eval"
+python evalAnomalyMask.py \
+    --models finetuned cityscapes coco \
+    --methods msp maxlogit maxentropy rba \
+    --temperatures 0.5 0.75 1.1 --store
+
+
+```
+

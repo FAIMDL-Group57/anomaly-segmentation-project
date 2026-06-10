@@ -13,6 +13,9 @@ from ood_metrics import fpr_at_95_tpr, calc_metrics, plot_roc, plot_pr,plot_barc
 from sklearn.metrics import roc_auc_score, roc_curve, auc, precision_recall_curve, average_precision_score
 from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 
+from helpers import (compute_anomaly_scores, resolve_gt_path,
+                     standardize_ood_gts, summarize_scores)
+
 seed = 42
 
 # general reproducibility
@@ -25,6 +28,14 @@ NUM_CLASSES = 20
 # gpu training specific
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = True
+
+# Folder names of the anomaly validation sets used by --full-report. Same set as
+# the EoMT mask baseline (eval/evalAnomalyMask.py) so the two reports line up.
+DATASET_NAMES = ["RoadAnomaly21", "RoadObsticle21", "FS_LostFound_full",
+                 "fs_static", "RoadAnomaly"]
+
+# Post-hoc methods the pixel baseline supports (no RbA -- that is mask-specific).
+ALL_METHODS = ["msp", "maxlogit", "maxentropy"]
 
 input_transform = Compose(
     [
@@ -75,6 +86,74 @@ def _store_anomaly_result(anomaly_result, path, method):
     fname = osp.basename(path).rsplit(".", 1)[0] + ".png"
     cv2.imwrite(osp.join(out_dir, fname), heatmap)
 
+
+
+def load_ood_gts(path):
+    # Resolve the ground-truth mask for an image, resize it to the model's
+    # output resolution (target_transform), and standardise it to
+    # {0: inlier, 1: anomaly, 255: ignore} via the shared helper.
+    pathGT = resolve_gt_path(path)
+    mask = target_transform(Image.open(pathGT))
+    return standardize_ood_gts(np.array(mask), pathGT)
+
+def evaluate_dataset_full(model, dataset_dir, args, methods, temperatures):
+    """Return {score_name: (auprc, fpr95)} for one anomaly dataset."""
+    img_paths = sorted(
+        p for p in glob.glob(osp.join(dataset_dir, "images", "*"))
+        if p.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+    )
+    score_lists, gt_list = {}, []
+    for path in img_paths:
+        images = input_transform(Image.open(path).convert("RGB")).unsqueeze(0).float()
+        if not args.cpu:
+            images = images.cuda()
+        with torch.no_grad():
+            result = model(images)
+        scores = compute_anomaly_scores(result.squeeze(0), methods, temperatures)
+        try:
+            ood_gts = load_ood_gts(path)
+        except FileNotFoundError:
+            continue
+        if 1 not in np.unique(ood_gts):
+            continue  # need anomaly pixels (same rule as the single-method path)
+        valid = (ood_gts == 0) | (ood_gts == 1)
+        gt_list.append(ood_gts[valid])
+        for name, amap in scores.items():
+            score_lists.setdefault(name, []).append(amap[valid])
+        del result
+        if not args.cpu:
+            torch.cuda.empty_cache()
+
+    if not gt_list:
+        return {}
+    return summarize_scores(gt_list, score_lists)
+
+def run_full_report(model, args):
+    report_fh = open(args.report_file, "a") if args.report_file else None
+    for dataset_name in DATASET_NAMES:
+        dataset_dir = osp.join(args.anomaly_datadir, dataset_name)
+        if not osp.isdir(dataset_dir):
+            print(f"  [skip] missing {dataset_dir}")
+            continue
+        header = f"-- {dataset_name} --"
+        print(f"\n{header}", flush=True)
+        if report_fh:
+            report_fh.write(f"\n{header}\n")
+        res = evaluate_dataset_full(model, dataset_dir, args,
+                                    ALL_METHODS, args.temperatures)
+        for score_name, (auprc, fpr) in res.items():
+            line = (f"  {dataset_name:<18} {score_name:<10} "
+                    f"AuPRC {auprc:6.2f}  FPR95 {fpr:6.2f}")
+            print(line, flush=True)
+            if report_fh:
+                report_fh.write(line + "\n")
+        if report_fh:
+            report_fh.flush()
+    if report_fh:
+        report_fh.close()
+        print(f"\nDone. Appended full report to {args.report_file}")
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument(
@@ -95,6 +174,21 @@ def main():
     parser.add_argument('--method', default='msp',
                         choices=['msp', 'maxlogit', 'maxentropy'],
                         help='post-hoc anomaly score: MSP, Max Logit or Max Entropy')
+    parser.add_argument('--full-report', action='store_true',
+                        help='evaluate ALL datasets with ALL methods (incl. '
+                             'temperature-scaled MSP) and print a grouped report')
+    parser.add_argument('--anomaly-datadir',
+                        default=osp.join(osp.dirname(osp.abspath(__file__)),
+                                         'Anomaly_Validation_Datasets',
+                                         'Validation_Dataset'),
+                        help='folder containing the anomaly dataset subfolders '
+                             '(used by --full-report)')
+    parser.add_argument('--temperatures', nargs='*', type=float,
+                        default=[0.5, 0.75, 1.1],
+                        help='extra MSP temperatures for --full-report '
+                             '(t=1.0 is always included)')
+    parser.add_argument('--report-file', default='all_results_table.txt',
+                        help='append the --full-report output to this file')
     args = parser.parse_args()
     anomaly_score_list = []
     ood_gts_list = []
@@ -130,7 +224,11 @@ def main():
     model = load_my_state_dict(model, torch.load(weightspath, map_location=lambda storage, loc: storage))
     print ("Model and weights LOADED successfully")
     model.eval()
-    
+
+    if args.full_report:
+        run_full_report(model, args)
+        return
+
     for path in glob.glob(os.path.expanduser(str(args.input[0]))):
         print(path)
         images = input_transform((Image.open(path).convert('RGB'))).unsqueeze(0).float()
@@ -140,36 +238,15 @@ def main():
             result = model(images)
         anomaly_result = compute_anomaly_score(result, args.method)
         _store_anomaly_result(anomaly_result, path, args.method)
-        pathGT = path.replace("images", "labels_masks")                
-        if "RoadObsticle21" in pathGT:
-           pathGT = pathGT.replace("webp", "png")
-        if "fs_static" in pathGT:
-           pathGT = pathGT.replace("jpg", "png")                
-        if "RoadAnomaly" in pathGT:
-           pathGT = pathGT.replace("jpg", "png")  
 
-        mask = Image.open(pathGT)
-        mask = target_transform(mask)
-        ood_gts = np.array(mask)
-
-        if "RoadAnomaly" in pathGT:
-            ood_gts = np.where((ood_gts==2), 1, ood_gts)
-        if "LostAndFound" in pathGT:
-            ood_gts = np.where((ood_gts==0), 255, ood_gts)
-            ood_gts = np.where((ood_gts==1), 0, ood_gts)
-            ood_gts = np.where((ood_gts>1)&(ood_gts<201), 1, ood_gts)
-
-        if "Streethazard" in pathGT:
-            ood_gts = np.where((ood_gts==14), 255, ood_gts)
-            ood_gts = np.where((ood_gts<20), 0, ood_gts)
-            ood_gts = np.where((ood_gts==255), 1, ood_gts)
+        ood_gts = load_ood_gts(path)
 
         if 1 not in np.unique(ood_gts):
-            continue              
+            continue
         else:
              ood_gts_list.append(ood_gts)
              anomaly_score_list.append(anomaly_result)
-        del result, anomaly_result, ood_gts, mask
+        del result, anomaly_result, ood_gts
         torch.cuda.empty_cache()
 
     file.write( "\n")
