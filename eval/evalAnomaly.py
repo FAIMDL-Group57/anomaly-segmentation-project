@@ -13,6 +13,9 @@ from ood_metrics import fpr_at_95_tpr, calc_metrics, plot_roc, plot_pr,plot_barc
 from sklearn.metrics import roc_auc_score, roc_curve, auc, precision_recall_curve, average_precision_score
 from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 
+from helpers import (compute_anomaly_scores, resolve_gt_path,
+                     standardize_ood_gts, summarize_scores)
+
 seed = 42
 
 # general reproducibility
@@ -84,58 +87,14 @@ def _store_anomaly_result(anomaly_result, path, method):
     cv2.imwrite(osp.join(out_dir, fname), heatmap)
 
 
-# ---------------------------------------------------------------------------
-# Full-report helpers: evaluate every dataset with every method in one pass.
-# ---------------------------------------------------------------------------
-def _msp(logits, t):
-    # 1 - max softmax probability, with temperature scaling applied to the logits.
-    probs = torch.softmax(logits / t, dim=0)
-    return (1.0 - torch.max(probs, dim=0).values).data.cpu().numpy()
-
-def compute_all_anomaly_scores(result, methods, temperatures):
-    # One forward pass -> every requested anomaly map. Mirrors compute_anomaly_score
-    # but returns {score_name: [H, W] array} (higher = more anomalous) and adds the
-    # temperature-scaled MSP variants used in the report.
-    logits = result.squeeze(0)  # [C, H, W]
-    out = {}
-    if "maxlogit" in methods:
-        out["maxlogit"] = (-torch.max(logits, dim=0).values).data.cpu().numpy()
-    if "maxentropy" in methods:
-        probs = torch.softmax(logits, dim=0)
-        out["maxentropy"] = (
-            -torch.sum(probs * torch.log(probs + 1e-12), dim=0)).data.cpu().numpy()
-    if "msp" in methods:
-        out["msp"] = _msp(logits, 1.0)
-        for t in temperatures:
-            out[f"msp_t{t:g}"] = _msp(logits, t)
-    return out
 
 def load_ood_gts(path):
-    # Resolve the ground-truth mask for an image and standardise it to
-    # {0: inlier, 1: anomaly, 255: ignore}, matching the per-dataset remapping the
-    # single-method path uses below.
-    pathGT = path.replace("images", "labels_masks")
-    if "RoadObsticle21" in pathGT:
-        pathGT = pathGT.replace("webp", "png")
-    if "fs_static" in pathGT:
-        pathGT = pathGT.replace("jpg", "png")
-    if "RoadAnomaly" in pathGT:
-        pathGT = pathGT.replace("jpg", "png")
-
+    # Resolve the ground-truth mask for an image, resize it to the model's
+    # output resolution (target_transform), and standardise it to
+    # {0: inlier, 1: anomaly, 255: ignore} via the shared helper.
+    pathGT = resolve_gt_path(path)
     mask = target_transform(Image.open(pathGT))
-    ood_gts = np.array(mask)
-
-    if "RoadAnomaly" in pathGT:
-        ood_gts = np.where((ood_gts == 2), 1, ood_gts)
-    if "LostAndFound" in pathGT:
-        ood_gts = np.where((ood_gts == 0), 255, ood_gts)
-        ood_gts = np.where((ood_gts == 1), 0, ood_gts)
-        ood_gts = np.where((ood_gts > 1) & (ood_gts < 201), 1, ood_gts)
-    if "Streethazard" in pathGT:
-        ood_gts = np.where((ood_gts == 14), 255, ood_gts)
-        ood_gts = np.where((ood_gts < 20), 0, ood_gts)
-        ood_gts = np.where((ood_gts == 255), 1, ood_gts)
-    return ood_gts
+    return standardize_ood_gts(np.array(mask), pathGT)
 
 def evaluate_dataset_full(model, dataset_dir, args, methods, temperatures):
     """Return {score_name: (auprc, fpr95)} for one anomaly dataset."""
@@ -150,7 +109,7 @@ def evaluate_dataset_full(model, dataset_dir, args, methods, temperatures):
             images = images.cuda()
         with torch.no_grad():
             result = model(images)
-        scores = compute_all_anomaly_scores(result, methods, temperatures)
+        scores = compute_anomaly_scores(result.squeeze(0), methods, temperatures)
         try:
             ood_gts = load_ood_gts(path)
         except FileNotFoundError:
@@ -167,15 +126,7 @@ def evaluate_dataset_full(model, dataset_dir, args, methods, temperatures):
 
     if not gt_list:
         return {}
-
-    val_label = np.concatenate(gt_list)
-    results = {}
-    for name, chunks in score_lists.items():
-        val_out = np.concatenate(chunks)
-        auprc = average_precision_score(val_label, val_out) * 100.0
-        fpr = fpr_at_95_tpr(val_out, val_label) * 100.0
-        results[name] = (auprc, fpr)
-    return results
+    return summarize_scores(gt_list, score_lists)
 
 def run_full_report(model, args):
     report_fh = open(args.report_file, "a") if args.report_file else None
@@ -287,36 +238,15 @@ def main():
             result = model(images)
         anomaly_result = compute_anomaly_score(result, args.method)
         _store_anomaly_result(anomaly_result, path, args.method)
-        pathGT = path.replace("images", "labels_masks")                
-        if "RoadObsticle21" in pathGT:
-           pathGT = pathGT.replace("webp", "png")
-        if "fs_static" in pathGT:
-           pathGT = pathGT.replace("jpg", "png")                
-        if "RoadAnomaly" in pathGT:
-           pathGT = pathGT.replace("jpg", "png")  
 
-        mask = Image.open(pathGT)
-        mask = target_transform(mask)
-        ood_gts = np.array(mask)
-
-        if "RoadAnomaly" in pathGT:
-            ood_gts = np.where((ood_gts==2), 1, ood_gts)
-        if "LostAndFound" in pathGT:
-            ood_gts = np.where((ood_gts==0), 255, ood_gts)
-            ood_gts = np.where((ood_gts==1), 0, ood_gts)
-            ood_gts = np.where((ood_gts>1)&(ood_gts<201), 1, ood_gts)
-
-        if "Streethazard" in pathGT:
-            ood_gts = np.where((ood_gts==14), 255, ood_gts)
-            ood_gts = np.where((ood_gts<20), 0, ood_gts)
-            ood_gts = np.where((ood_gts==255), 1, ood_gts)
+        ood_gts = load_ood_gts(path)
 
         if 1 not in np.unique(ood_gts):
-            continue              
+            continue
         else:
              ood_gts_list.append(ood_gts)
              anomaly_score_list.append(anomaly_result)
-        del result, anomaly_result, ood_gts, mask
+        del result, anomaly_result, ood_gts
         torch.cuda.empty_cache()
 
     file.write( "\n")

@@ -39,8 +39,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from sklearn.metrics import average_precision_score
-from ood_metrics import fpr_at_95_tpr
 
 # This file is in <repo>/eval/, but the EoMT package (models.*, training.*) and
 # its checkpoints live under <repo>/eomt/. Resolve everything against absolute
@@ -50,6 +48,8 @@ REPO_ROOT = os.path.dirname(HERE)                            # <repo>
 EOMT_ROOT = os.path.join(REPO_ROOT, "eomt")                  # <repo>/eomt
 sys.path.insert(0, EOMT_ROOT)
 
+from helpers import (compute_anomaly_scores, resolve_gt_path,
+                     standardize_ood_gts, summarize_scores)
 from models.vit import ViT
 from models.eomt import EoMT
 from training.mask_classification_semantic import MaskClassificationSemantic
@@ -138,37 +138,6 @@ def load_ckpt_into(model, ckpt_path):
     return model
 
 
-# ---------------------------------------------------------------------------
-# Anomaly scoring -- all methods share one forward pass
-# ---------------------------------------------------------------------------
-def compute_anomaly_scores(logits, methods, temperatures):
-    """logits: per-pixel class-presence scores (C, H, W) from
-    to_per_pixel_logits_semantic. Returns {score_name: (H, W) numpy array}
-    where higher = more anomalous.
-    """
-    logits = logits.float()
-    out = {}
-    if "maxlogit" in methods:
-        out["maxlogit"] = (-logits.max(dim=0).values).cpu().numpy()
-    if "rba" in methods:
-        # Rejected by All: little total known-class evidence => anomalous.
-        out["rba"] = (-logits.sum(dim=0)).cpu().numpy()
-    if "maxentropy" in methods:
-        probs = F.softmax(logits, dim=0)
-        out["maxentropy"] = (
-            -(probs * torch.log(probs + 1e-12)).sum(dim=0)).cpu().numpy()
-    if "msp" in methods:
-        out["msp"] = _msp(logits, 1.0)
-        for t in temperatures:
-            out[f"msp_t{t:g}"] = _msp(logits, t)
-    return out
-
-
-def _msp(logits, t):
-    # Temperature is applied to the logits before softmax (confidence calibration).
-    probs = F.softmax(logits / t, dim=0)
-    return (1.0 - probs.max(dim=0).values).cpu().numpy()
-
 
 # ---------------------------------------------------------------------------
 # Windowed inference (identical pipeline to eval_finetune.py)
@@ -190,33 +159,6 @@ def infer_logits(model, img_uint8_chw, crop_size):
     return logits
 
 
-# ---------------------------------------------------------------------------
-# Ground-truth label mapping (consistent with eval/evalAnomaly.py)
-# ---------------------------------------------------------------------------
-def map_ood_labels(raw_gts, dataset_name):
-    """Standardise a raw GT mask to {0: inlier, 1: anomaly, 255: ignore}.
-
-    The provided validation bundle already ships standardised {0,1,255} masks for
-    most sets (RoadAnomaly encodes the anomaly as 2); the raw-Fishyscapes branch
-    is kept so the script also works on un-processed LostAndFound / fs_static.
-    """
-    if raw_gts.ndim == 3:
-        raw_gts = raw_gts[:, :, 0]
-    name = dataset_name.lower()
-    ood = np.full_like(raw_gts, 255, dtype=np.uint8)
-
-    already_standard = set(np.unique(raw_gts)).issubset({0, 1, 255})
-    if already_standard or "roadanomaly" in name or "roadobsticle" in name:
-        ood[raw_gts == 0] = 0
-        ood[raw_gts == 1] = 1
-        ood[raw_gts == 2] = 1            # RoadAnomaly encodes anomaly as label 2
-    elif "lostfound" in name or "static" in name:
-        ood[raw_gts == 1] = 0            # raw Fishyscapes: 1 = road/inlier
-        ood[(raw_gts > 1) & (raw_gts < 205)] = 1
-        ood[raw_gts == 0] = 255
-    return ood
-
-
 def store_heatmap(anomaly_map, img_path, model_name, dataset, score_name):
     # One subtree per model so the three model runs don't overwrite each other,
     # then per dataset (filenames can collide across datasets) and per score.
@@ -232,12 +174,6 @@ def store_heatmap(anomaly_map, img_path, model_name, dataset, score_name):
 # ---------------------------------------------------------------------------
 # Per-dataset evaluation
 # ---------------------------------------------------------------------------
-def gt_path_for(img_path):
-    gt = img_path.replace(os.sep + "images" + os.sep,
-                          os.sep + "labels_masks" + os.sep)
-    return gt.rsplit(".", 1)[0] + ".png"
-
-
 def evaluate_dataset(model, model_name, crop_size, dataset_dir, dataset_name,
                      methods, temperatures, store=False):
     """Return {score_name: (auprc, fpr95)} for one dataset."""
@@ -255,10 +191,10 @@ def evaluate_dataset(model, model_name, crop_size, dataset_dir, dataset_name,
         # so EoMT's sliding window keeps its overlap and we score at full res.
         img_pil = Image.open(path).convert("RGB")
         try:
-            mask = Image.open(gt_path_for(path)).resize(img_pil.size, Image.NEAREST)
+            mask = Image.open(resolve_gt_path(path)).resize(img_pil.size, Image.NEAREST)
         except FileNotFoundError:
             continue
-        ood_gts = map_ood_labels(np.array(mask), dataset_name)
+        ood_gts = standardize_ood_gts(np.array(mask), dataset_name)
         valid = (ood_gts == 0) | (ood_gts == 1)
         if not valid.any() or 1 not in np.unique(ood_gts):
             continue  # need anomaly pixels (same rule as the pixel baseline)
@@ -280,15 +216,7 @@ def evaluate_dataset(model, model_name, crop_size, dataset_dir, dataset_name,
     if not gt_list:
         print(f"  [skip] {dataset_name}: no valid images with anomaly pixels")
         return {}
-
-    val_label = np.concatenate(gt_list)
-    results = {}
-    for name, chunks in score_lists.items():
-        val_out = np.concatenate(chunks)
-        auprc = average_precision_score(val_label, val_out) * 100.0
-        fpr = fpr_at_95_tpr(val_out, val_label) * 100.0
-        results[name] = (auprc, fpr)
-    return results
+    return summarize_scores(gt_list, score_lists)
 
 
 # ---------------------------------------------------------------------------
