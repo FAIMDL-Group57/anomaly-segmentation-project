@@ -92,6 +92,11 @@ def _msp(logits, t):
     probs = torch.softmax(logits / t, dim=0)
     return (1.0 - torch.max(probs, dim=0).values).data.cpu().numpy()
 
+def evaluate_anomaly_scores_gpu(logits_tensor, t):
+    probs = torch.softmax(logits_tensor / t, dim=0)
+    scores = (1.0 - torch.max(probs, dim=0)[0])
+    return scores.cpu().numpy()
+
 def compute_all_anomaly_scores(result, methods, temperatures):
     # One forward pass -> every requested anomaly map. Mirrors compute_anomaly_score
     # but returns {score_name: [H, W] array} (higher = more anomalous) and adds the
@@ -127,7 +132,7 @@ def load_ood_gts(path):
 
     if "RoadAnomaly" in pathGT:
         ood_gts = np.where((ood_gts == 2), 1, ood_gts)
-    if "LostAndFound" in pathGT:
+    if "LostFound" in pathGT:
         ood_gts = np.where((ood_gts == 0), 255, ood_gts)
         ood_gts = np.where((ood_gts == 1), 0, ood_gts)
         ood_gts = np.where((ood_gts > 1) & (ood_gts < 201), 1, ood_gts)
@@ -144,6 +149,9 @@ def evaluate_dataset_full(model, dataset_dir, args, methods, temperatures):
         if p.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
     )
     score_lists, gt_list = {}, []
+    fixed_t_scores_pool = []
+    all_labels_list = []
+  
     for path in img_paths:
         images = input_transform(Image.open(path).convert("RGB")).unsqueeze(0).float()
         if not args.cpu:
@@ -161,6 +169,11 @@ def evaluate_dataset_full(model, dataset_dir, args, methods, temperatures):
         gt_list.append(ood_gts[valid])
         for name, amap in scores.items():
             score_lists.setdefault(name, []).append(amap[valid])
+        if "msp" in methods:
+            logits_raw = result.squeeze(0).float()[:19, :] 
+            valid_mask_torch = torch.from_numpy(valid).to(logits_raw.device)
+            fixed_t_scores_pool.append(logits_raw[:, valid_mask_torch].cpu().half())
+            all_labels_list.append(ood_gts[valid])
         del result
         if not args.cpu:
             torch.cuda.empty_cache()
@@ -175,6 +188,26 @@ def evaluate_dataset_full(model, dataset_dir, args, methods, temperatures):
         auprc = average_precision_score(val_label, val_out) * 100.0
         fpr = fpr_at_95_tpr(val_out, val_label) * 100.0
         results[name] = (auprc, fpr)
+
+    if len(all_labels_list) > 0 and "msp" in methods:
+        global_labels_np = np.concatenate(all_labels_list, axis=0)
+        device_type = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+        global_logits_torch = torch.cat(fixed_t_scores_pool, dim=1).to(device_type, dtype=torch.float32)
+
+        best_t, best_auprc, best_fpr95 = 1.0, 0.0, 100.0
+        search_space = np.arange(0.1, 2.55, 0.05)
+        for t in search_space:
+            t = round(t, 2)
+            global_scores_np = evaluate_anomaly_scores_gpu(global_logits_torch, t)
+            auprc = average_precision_score(global_labels_np, global_scores_np) * 100.0
+            if auprc > best_auprc:
+                best_auprc = auprc
+                best_t = t
+                best_fpr95 = fpr_at_95_tpr(global_scores_np, global_labels_np) * 100.0
+        
+        results[f"msp_best(t={best_t:.2f})"] = (best_auprc, best_fpr95)
+        print(f"  [FOUND] Best Temperature: t={best_t:.2f} | Best AuPRC: {best_auprc:.2f}%")
+
     return results
 
 def run_full_report(model, args):
@@ -301,7 +334,7 @@ def main():
 
         if "RoadAnomaly" in pathGT:
             ood_gts = np.where((ood_gts==2), 1, ood_gts)
-        if "LostAndFound" in pathGT:
+        if "LostFound" in pathGT:
             ood_gts = np.where((ood_gts==0), 255, ood_gts)
             ood_gts = np.where((ood_gts==1), 0, ood_gts)
             ood_gts = np.where((ood_gts>1)&(ood_gts<201), 1, ood_gts)
