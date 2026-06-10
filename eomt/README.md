@@ -25,6 +25,10 @@ python3 -m pip install -r requirements.txt
 wandb login
 ```
 
+## Download Fine-Tuning Checkpoints
+Download the *checkpoints* folder from https://drive.proton.me/urls/Q8P9X5099C#YQcur1L9Ug4p 
+and place the full folder under `eomt/` 
+
 ## Data preparation for training
 
 You do **not** need to unzip any of the downloaded files.  
