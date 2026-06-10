@@ -25,9 +25,12 @@ python3 -m pip install -r requirements.txt
 wandb login
 ```
 
-## Download Fine-Tuning Checkpoints
+## Download Fine-Tuned Checkpoints
 Download the *checkpoints* folder from https://drive.proton.me/urls/Q8P9X5099C#YQcur1L9Ug4p 
 and place the full folder under `eomt/` 
+
+## Running the evals
+The baseline EoMT evaluations on the macro-class evaluation pipeline are performed in `inference.ipynb`.  Evaluations on every fine-tune checkpoint is performed in `eval/eval_finetune.py` (evaluating on both macro-class pipeline and original 19-class Cityscapes class set). Our experimental modified PQ eval is also placed in this folder.
 
 ## Data preparation for training
 
